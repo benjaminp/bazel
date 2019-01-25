@@ -35,11 +35,13 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <algorithm>
 #include <string>
 
 #ifndef MS_REC
@@ -52,6 +54,122 @@
 #include "src/main/tools/linux-sandbox.h"
 #include "src/main/tools/logging.h"
 #include "src/main/tools/process-tools.h"
+
+static std::string sandbox_root_dir = "";
+static bool rootfs;
+
+static bool IsDirectory(const char *path) {
+  struct stat sb;
+  if (stat(path, &sb) < 0) {
+    DIE("stat(%s)", path);
+  }
+  return S_ISDIR(sb.st_mode);
+}
+
+// Recursively creates the file or directory specified in "path" and its parent
+// directories.
+static int CreateTarget(const char *path, bool is_directory) {
+  PRINT_DEBUG("CreateTarget(%s, %s)", path, is_directory ? "true" : "false");
+  if (path == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  struct stat sb;
+  // If the path already exists...
+  if (stat(path, &sb) == 0) {
+    if (is_directory && S_ISDIR(sb.st_mode)) {
+      // and it's a directory and supposed to be a directory, we're done here.
+      return 0;
+    } else if (!is_directory && S_ISREG(sb.st_mode)) {
+      // and it's a regular file and supposed to be one, we're done here.
+      return 0;
+    } else {
+      // otherwise something is really wrong.
+      errno = is_directory ? ENOTDIR : EEXIST;
+      return -1;
+    }
+  } else {
+    // If stat failed because of any error other than "the path does not exist",
+    // this is an error.
+    if (errno != ENOENT) {
+      return -1;
+    }
+  }
+
+  // Create the parent directory.
+  if (CreateTarget(dirname(strdupa(path)), true) < 0) {
+    DIE("CreateTarget(%s, true)", dirname(strdupa(path)));
+  }
+
+  if (is_directory) {
+    if (mkdir(path, 0755) < 0) {
+      DIE("mkdir(%s, 0755)", path);
+    }
+  } else {
+    int handle;
+    if ((handle = open(path, O_CREAT | O_WRONLY | O_EXCL, 0666)) < 0) {
+      DIE("open(%s, O_CREAT | O_WRONLY | O_EXCL, 0666)", path);
+    }
+    if (close(handle) < 0) {
+      DIE("close(%d)", handle);
+    }
+  }
+
+  return 0;
+}
+
+static void SetupDevices() {
+  if (!rootfs)
+    return;
+  CreateTarget("dev", true);
+  const char *devs[] = {"/dev/null", "/dev/random", "/dev/urandom", "/dev/zero",
+                        NULL};
+  for (int i = 0; devs[i] != NULL; i++) {
+    CreateTarget(devs[i] + 1, false);
+    if (mount(devs[i], devs[i] + 1, NULL, MS_BIND, NULL) < 0) {
+      DIE("mount(%s, %s, NULL, MS_BIND, NULL)", devs[i], devs[i] + 1);
+    }
+  }
+
+  if (symlink("/proc/self/fd", "dev/fd") < 0) {
+    DIE("symlink(/proc/self/fd, dev/fd)");
+  }
+}
+
+static void CopyFile(const char *src, const char *dst) {
+  int in_fd = open(src, O_RDONLY);
+  if (in_fd < 0) {
+    DIE("open(%s, O_RDONLY)", src);
+  }
+  int out_fd = open(dst, O_CREAT | O_WRONLY | O_EXCL, 0666);
+  if (out_fd < 0) {
+    DIE("open(%s, O_CREAT | O_WRONLY | O_EXCL, 0666)", dst);
+  }
+
+  char buf[8192];
+  while (1) {
+    ssize_t result = read(in_fd, &buf[0], sizeof(buf));
+    if (!result) {
+      break;
+    }
+    if (result < 0) {
+      if (errno == EINTR) {
+	continue;
+      }
+      DIE("read(in_fd, &buf[0], sizeof(buf)) for %s -> %s", src, dst);
+    }
+    if (write(out_fd, &buf[0], result) != result) {
+      DIE("write(out_fd, &buf[0], result) for %s -> %s", src, dst);
+    }
+  }
+  if (close(in_fd) < 0) {
+    DIE("close(%s)", src);
+  }
+  if (close(out_fd) < 0) {
+    DIE("close(%s)", dst);
+  }
+}
 
 static int global_child_pid;
 
@@ -161,12 +279,72 @@ static void SetupUtsNamespace() {
 }
 
 static void MountFilesystems() {
+  // Crappily detect if there's a rootfs.
+  rootfs = std::find(opt.bind_mount_targets.begin(), opt.bind_mount_targets.end(), "/usr") != opt.bind_mount_targets.end();
+  if (rootfs) {
+    // working_dir is something like .../bazel-sandbox/[RANDOMNESS]/execroot/__main__. Place the root
+    // two levels up.
+    sandbox_root_dir = opt.working_dir.substr(0, opt.working_dir.find_last_of('/', opt.working_dir.find_last_of('/') - 1)) + "/root";
+    PRINT_DEBUG("sandbox root dir: %s", sandbox_root_dir.c_str());
+    CreateTarget(sandbox_root_dir.c_str(), true);
+    if (mount(sandbox_root_dir.c_str(), sandbox_root_dir.c_str(), NULL, MS_BIND | MS_NOSUID, NULL) < 0) {
+      DIE("mount(%s, %s, NULL, MS_BIND | MS_NOSUID, NULL)", sandbox_root_dir.c_str(), sandbox_root_dir.c_str());
+    }
+  }
+  if (chdir((sandbox_root_dir + "/").c_str()) < 0) {
+    DIE("chdir(%s)", sandbox_root_dir.c_str());
+  }
+
   for (const std::string &tmpfs_dir : opt.tmpfs_dirs) {
-    PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
-    if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
-              MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
-      DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
-          tmpfs_dir.c_str());
+    if (strncmp(tmpfs_dir.c_str(), sandbox_root_dir.c_str(), tmpfs_dir.size()) == 0) {
+      // If sandbox root is under one of the tmpfs dir (e.g., when attempting to tmpfs mount
+      // /dev/shm if sandbox root is /dev/shm/foobar)
+      //
+      // IMPORTANT:
+      // - /dev/shm should be exclusive to the current sandbox. No changes to /dev/shm
+      //   should leak out of the sandbox into the host system or other sandboxes.
+      PRINT_DEBUG("tmpfs overlaps with working dir: %s", tmpfs_dir.c_str());
+
+      // Using example tmpfs_dir = /dev/shm and working_dir = /dev/shm/bazel-sandbox/1234/execroot/__main__
+      // Sandbox root = /dev/shm/bazel-sandbox/1234/root (PWD).
+      // Create dev/shm in PWD and bind mount current /dev/shm into dev/shm.
+      CreateTarget(tmpfs_dir.c_str() + 1, true);
+      if (mount(tmpfs_dir.c_str(), tmpfs_dir.c_str() + 1, nullptr, MS_BIND,
+                nullptr) < 0) {
+        DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", tmpfs_dir.c_str(),
+            tmpfs_dir.c_str() + 1);
+      }
+
+      // Mount empty tmpfs over /dev/shm
+      PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
+      CreateTarget(tmpfs_dir.c_str(), true);
+      if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
+                MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
+        DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
+            tmpfs_dir.c_str());
+      }
+
+      // Create /dev/shm/bazel-sandbox/1234/execroot/__main__
+      CreateTarget(opt.working_dir.c_str(), true);
+      // Bind mount dev/shm/bazel-sandbox/1234/execroot/__main__ to /dev/shm/bazel-sandbox/1234/execroot/__main__
+      // At this point, we have a reference to working dir in /dev/shm/bazel-sandbox/1234/execroot/__main__
+      if (mount(opt.working_dir.c_str() + 1, opt.working_dir.c_str(), nullptr, MS_BIND,
+                nullptr) < 0) {
+        DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str() + 1,
+            opt.working_dir.c_str());
+      }
+
+      // PWD is still /dev/shm/bazel-sandbox/1234/root (in the old /dev/shm mount)
+      // This needs to be maintained because we run `pivot_root` from this dir and `pivot_root`
+      // requires old and new roots to be in the same mount point.
+    } else {
+      PRINT_DEBUG("tmpfs: %s", tmpfs_dir.c_str());
+      CreateTarget(tmpfs_dir.c_str(), true);
+      if (mount("tmpfs", tmpfs_dir.c_str(), "tmpfs",
+            MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr) < 0) {
+        DIE("mount(tmpfs, %s, tmpfs, MS_NOSUID | MS_NODEV | MS_NOATIME, nullptr)",
+            tmpfs_dir.c_str());
+      }
     }
   }
 
@@ -174,17 +352,26 @@ static void MountFilesystems() {
   // do this is by bind-mounting it upon itself.
   PRINT_DEBUG("working dir: %s", opt.working_dir.c_str());
 
-  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str(), nullptr, MS_BIND,
+  CreateTarget(opt.working_dir.c_str() + 1, true);
+  if (mount(opt.working_dir.c_str(), opt.working_dir.c_str() + 1, nullptr, MS_BIND,
             nullptr) < 0) {
     DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", opt.working_dir.c_str(),
-        opt.working_dir.c_str());
+        opt.working_dir.c_str() + 1);
   }
 
   for (size_t i = 0; i < opt.bind_mount_sources.size(); i++) {
     const std::string& source = opt.bind_mount_sources.at(i);
     const std::string& target = opt.bind_mount_targets.at(i);
+    if (target == "/etc/hosts") {
+      // HACK(): make /etc/hosts writable by making a copy of the file
+      PRINT_DEBUG("copy: %s -> %s", source.c_str(), target.c_str() + 1);
+      CopyFile(source.c_str(), target.c_str() + 1);
+      continue;
+    }
+    CreateTarget(target.c_str() + 1, IsDirectory(source.c_str()));
     PRINT_DEBUG("bind mount: %s -> %s", source.c_str(), target.c_str());
-    if (mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr) < 0) {
+    // rootfs: MS_REC is required for EC, which bind mounts things into the workspace.
+    if (mount(source.c_str(), target.c_str() + 1, nullptr, MS_BIND | MS_REC, nullptr) < 0) {
       DIE("mount(%s, %s, nullptr, MS_BIND, nullptr)", source.c_str(),
           target.c_str());
     }
@@ -192,18 +379,29 @@ static void MountFilesystems() {
 
   for (const std::string &writable_file : opt.writable_files) {
     PRINT_DEBUG("writable: %s", writable_file.c_str());
-    if (mount(writable_file.c_str(), writable_file.c_str(), nullptr,
+    CreateTarget(writable_file.c_str() + 1, IsDirectory(writable_file.c_str()));
+    if (mount(writable_file.c_str(), writable_file.c_str() + 1, nullptr,
               MS_BIND | MS_REC, nullptr) < 0) {
       DIE("mount(%s, %s, nullptr, MS_BIND | MS_REC, nullptr)",
-          writable_file.c_str(), writable_file.c_str());
+          writable_file.c_str(), writable_file.c_str() + 1);
     }
   }
 }
 
 // We later remount everything read-only, except the paths for which this method
 // returns true.
-static bool ShouldBeWritable(const std::string &mnt_dir) {
-  if (mnt_dir == opt.working_dir) {
+static bool ShouldBeWritable(const std::string &mnt_dir_x) {
+  if (mnt_dir_x == opt.working_dir) {
+    return true;
+  }
+
+  if (mnt_dir_x.compare(0, sandbox_root_dir.size(), sandbox_root_dir)) {
+    return false;
+  }
+
+  const std::string mnt_dir = mnt_dir_x.substr(sandbox_root_dir.size());
+
+  if (mnt_dir == "") {
     return true;
   }
 
@@ -232,6 +430,10 @@ static void MakeFilesystemMostlyReadOnly() {
 
   struct mntent *ent;
   while ((ent = getmntent(mounts)) != nullptr) {
+    // Skip things not under the sandbox root.
+    if (strncmp(ent->mnt_dir, sandbox_root_dir.c_str(), sandbox_root_dir.size()))
+      continue;
+
     int mountFlags = MS_BIND | MS_REMOUNT;
 
     // MS_REMOUNT does not allow us to change certain flags. This means, we have
@@ -289,7 +491,8 @@ static void MakeFilesystemMostlyReadOnly() {
 static void MountProc() {
   // Mount a new proc on top of the old one, because the old one still refers to
   // our parent PID namespace.
-  if (mount("/proc", "/proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
+  CreateTarget("proc", true);
+  if (mount("proc", "proc", "proc", MS_NODEV | MS_NOEXEC | MS_NOSUID,
             nullptr) < 0) {
     DIE("mount");
   }
@@ -326,6 +529,31 @@ static void SetupNetworking() {
 }
 
 static void EnterSandbox() {
+  if (rootfs) {
+    // Move the real root to old_root, then detach it.
+    char old_root[] = "tmp/old-root-XXXXXX";
+    if (mkdtemp(old_root) == NULL) {
+      DIE("mkdtemp(%s)", old_root);
+    }
+
+    // pivot_root has no wrapper in libc, so we need syscall()
+    if (syscall(SYS_pivot_root, ".", old_root) < 0) {
+      DIE("pivot_root(., %s)", old_root);
+    }
+
+    if (chroot(".") < 0) {
+      DIE("chroot(.)");
+    }
+
+    if (umount2(old_root, MNT_DETACH) < 0) {
+      DIE("umount2(%s, MNT_DETACH)", old_root);
+    }
+
+    if (rmdir(old_root) < 0) {
+      DIE("rmdir(%s)", old_root);
+    }
+  }
+
   if (chdir(opt.working_dir.c_str()) < 0) {
     DIE("chdir(%s)", opt.working_dir.c_str());
   }
@@ -474,8 +702,9 @@ int Pid1Main(void *sync_pipe_param) {
     SetupUtsNamespace();
   }
   MountFilesystems();
-  MakeFilesystemMostlyReadOnly();
   MountProc();
+  SetupDevices();
+  MakeFilesystemMostlyReadOnly();
   SetupNetworking();
   EnterSandbox();
   SetupSignalHandlers();

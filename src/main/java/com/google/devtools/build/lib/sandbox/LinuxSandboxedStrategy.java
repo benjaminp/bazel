@@ -16,6 +16,7 @@ package com.google.devtools.build.lib.sandbox;
 
 import com.google.devtools.build.lib.actions.ExecutionStrategy;
 import com.google.devtools.build.lib.actions.SpawnActionContext;
+import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.exec.AbstractSpawnStrategy;
 import com.google.devtools.build.lib.exec.SpawnRunner;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
@@ -65,12 +66,37 @@ public final class LinuxSandboxedStrategy extends AbstractSpawnStrategy {
     inaccessibleHelperDir.setWritable(false);
     inaccessibleHelperDir.setExecutable(false);
 
+    SandboxOptions sandboxOptions = cmdEnv.getOptions().getOptions(SandboxOptions.class);
+    BlazeDirectories blazeDirs = cmdEnv.getDirectories();
+    String rootfsCachePath = sandboxOptions.sandboxRootfsCachePath;
+    if (rootfsCachePath == null || rootfsCachePath.isEmpty()) {
+	rootfsCachePath = blazeDirs.getOutputBase().getRelative("rootfs").getPathString();
+    }
+    LinuxSandboxRootfsManager rootfsManager = null;
+    if (sandboxOptions.sandboxRootfs != null) {
+      rootfsManager = LinuxSandboxRootfsManager.create(
+          cmdEnv.getRuntime().getFileSystem(),
+          sandboxOptions.sandboxRootfs,
+          rootfsCachePath,
+          cmdEnv);
+    }
+
     return new LinuxSandboxedSpawnRunner(
         cmdEnv,
         sandboxBase,
         inaccessibleHelperFile,
         inaccessibleHelperDir,
         timeoutKillDelay,
-        sandboxfsProcess);
+        sandboxfsProcess,
+        rootfsManager);
+  }
+
+  public String getActionHashKey() {
+    // if (rootfsManager != null) {
+    //   String labelString = rootfsManager.getRootfsLabel().getDefaultCanonicalForm();
+    //   return "sandbox6" + labelString;
+    // } else {
+      return "sandbox6";
+   //    }
   }
 }

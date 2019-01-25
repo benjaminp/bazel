@@ -18,6 +18,8 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.devtools.build.lib.analysis.config.BuildConfiguration.EmptyToNullLabelConverter;
+import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.common.options.Converter;
@@ -298,4 +300,33 @@ public class SandboxOptions extends OptionsBase {
           "If enabled, the sandbox will expand tree artifacts in runfiles, thus the files that "
               + "are contained in the tree artifact will be symlinked as individual files.")
   public boolean symlinkedSandboxExpandsTreeArtifactsInRunfilesTree;
+
+  @Option(
+    name = "sandbox_rootfs",
+    category = "strategy",
+    defaultValue = "",
+    converter = EmptyToNullLabelConverter.class,
+    documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+    effectTags = {OptionEffectTag.UNKNOWN},
+    help = "File target for a gzipped tarball (.tar.gz, not .tar or something else) containing "
+             + "the directory to be mounted "
+             + "as root inside sandbox instead of the host machine. For example, "
+             + "--sandbox_rootfs=@some_repo//file:file_name. "
+             + "The tarball needs to extract as if the current directory is root. That is, "
+             + "if extracted to `/somedir`, `/usr` should be at `/somedir/usr`."
+  )
+  public Label sandboxRootfs;
+
+  @Option(
+    name = "sandbox_rootfs_cache_path",
+    category = "config",
+    defaultValue = "",
+    documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+    effectTags = {OptionEffectTag.UNKNOWN},
+    help = "The path to cache extracted rootfs images. By default, this is stored "
+             + "somewhere in the output root, and is cleaned up by bazel. If "
+             + "a custom value is used, then the user is responsible for cleaning "
+             + "the directory as needed."
+  )
+  public String sandboxRootfsCachePath;
 }
