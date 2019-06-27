@@ -22,20 +22,23 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import com.google.devtools.build.lib.actions.ActionInput;
+import com.google.devtools.build.lib.actions.FileArtifactValue;
 import com.google.devtools.build.lib.actions.MetadataProvider;
+import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.SortedMap;
 import javax.annotation.Nullable;
 
 /** A merkle tree representation as defined by the remote execution api. */
-public class MerkleTree {
+public final class MerkleTree {
 
   private final Map<Digest, Directory> digestDirectoryMap;
   private final Map<Digest, ActionInput> digestActionInputMap;
@@ -73,6 +76,94 @@ public class MerkleTree {
     return Iterables.concat(digestDirectoryMap.keySet(), digestActionInputMap.keySet());
   }
 
+  public static Digest computeRootDigest(
+      SortedMap<PathFragment, ActionInput> inputs,
+      MetadataProvider metadataProvider,
+      Path execRoot,
+      DigestUtil digestUtil)
+      throws IOException {
+    return build(inputs, metadataProvider, execRoot, digestUtil, null, null);
+  }
+
+  private static Digest build(
+      SortedMap<PathFragment, ActionInput> inputs,
+      MetadataProvider metadataProvider,
+      Path execRoot,
+      DigestUtil digestUtil,
+      @Nullable Map<Digest, Directory> digestDirectoryMap,
+      @Nullable Map<Digest, ActionInput> digestActionInputMap)
+      throws IOException {
+    PathFragment currentDirectory = PathFragment.EMPTY_FRAGMENT;
+    ArrayList<Directory.Builder> directoryStack = new ArrayList<>();
+    Directory.Builder currentDirectoryBuilder = Directory.newBuilder();
+    directoryStack.add(currentDirectoryBuilder);
+    for (Map.Entry<PathFragment, ActionInput> e : inputs.entrySet()) {
+      PathFragment path = e.getKey();
+      ActionInput input = e.getValue();
+      PathFragment pathDirectory = path.getParentDirectory();
+      if (!pathDirectory.equals(currentDirectory)) {
+        while (!pathDirectory.startsWith(currentDirectory)) {
+          Directory finishedDirectory = directoryStack.remove(directoryStack.size() - 1).build();
+          Digest directoryDigest = digestUtil.compute(finishedDirectory);
+          if (digestDirectoryMap != null) {
+            digestDirectoryMap.put(directoryDigest, finishedDirectory);
+          }
+          directoryStack
+              .get(directoryStack.size() - 1)
+              .addDirectoriesBuilder()
+              .setName(currentDirectory.getBaseName())
+              .setDigest(directoryDigest);
+          currentDirectory = currentDirectory.getParentDirectory();
+        }
+        int newSegments = pathDirectory.relativeTo(currentDirectory).segmentCount();
+        for (int i = 0; i < newSegments; i++) {
+          directoryStack.add(Directory.newBuilder());
+        }
+        currentDirectoryBuilder = directoryStack.get(directoryStack.size() - 1);
+        currentDirectory = pathDirectory;
+      }
+      Digest digest;
+      if (input instanceof VirtualActionInput) {
+        digest = digestUtil.compute((VirtualActionInput) input);
+      } else {
+        FileArtifactValue metadata =
+            Preconditions.checkNotNull(
+                metadataProvider.getMetadata(input),
+                "missing metadata for '%s'",
+                input.getExecPathString());
+        Preconditions.checkState(metadata.getType() == com.google.devtools.build.lib.actions.FileStateType.REGULAR_FILE);
+        digest = digestUtil.buildDigest(metadata.getDigest(), metadata.getSize());
+      }
+      if (digestActionInputMap != null) {
+        digestActionInputMap.put(digest, input);
+      }
+      currentDirectoryBuilder
+          .addFilesBuilder()
+          .setName(path.getBaseName())
+          .setDigest(digest)
+          .setIsExecutable(true);
+    }
+    Digest directoryDigest;
+    while (true) {
+      Directory finishedDirectory = directoryStack.remove(directoryStack.size() - 1).build();
+      directoryDigest = digestUtil.compute(finishedDirectory);
+      if (digestDirectoryMap != null) {
+        digestDirectoryMap.put(directoryDigest, finishedDirectory);
+      }
+      if (directoryStack.isEmpty()) {
+        break;
+      }
+      directoryStack
+          .get(directoryStack.size() - 1)
+          .addDirectoriesBuilder()
+          .setName(currentDirectory.getBaseName())
+          .setDigest(directoryDigest);
+      currentDirectory = currentDirectory.getParentDirectory();
+    }
+    Preconditions.checkState(currentDirectory.equals(PathFragment.EMPTY_FRAGMENT));
+    return directoryDigest;
+  }
+
   /**
    * Constructs a merkle tree from a lexicographically sorted map of inputs (files).
    *
@@ -91,8 +182,18 @@ public class MerkleTree {
       DigestUtil digestUtil)
       throws IOException {
     try (SilentCloseable c = Profiler.instance().profile("MerkleTree.build")) {
-      InputTree tree = InputTree.build(inputs, metadataProvider, execRoot, digestUtil);
-      return build(tree, digestUtil);
+      Map<Digest, Directory> digestDirectoryMap = Maps.newHashMap();
+      Map<Digest, ActionInput> digestActionInputMap =
+          Maps.newHashMapWithExpectedSize(inputs.size());
+      Digest root =
+          build(
+              inputs,
+              metadataProvider,
+              execRoot,
+              digestUtil,
+              digestDirectoryMap,
+              digestActionInputMap);
+      return new MerkleTree(digestDirectoryMap, digestActionInputMap, root);
     }
   }
 

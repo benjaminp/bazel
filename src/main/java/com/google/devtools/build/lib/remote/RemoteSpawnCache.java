@@ -125,9 +125,8 @@ final class RemoteSpawnCache implements SpawnCache {
     }
 
     SortedMap<PathFragment, ActionInput> inputMap = context.getInputMapping(true);
-    MerkleTree merkleTree =
-        MerkleTree.build(inputMap, context.getMetadataProvider(), execRoot, digestUtil);
-    Digest merkleTreeRoot = merkleTree.getRootDigest();
+    Digest merkleTreeRoot =
+        MerkleTree.computeRootDigest(inputMap, context.getMetadataProvider(), execRoot, digestUtil);
 
     // Get the remote platform properties.
     Platform platform =

@@ -110,6 +110,10 @@ public class MerkleTreeTest {
     // assert
     Digest expectedRootDigest = digestUtil.compute(rootDir);
     assertThat(tree.getRootDigest()).isEqualTo(expectedRootDigest);
+    assertThat(
+            MerkleTree.computeRootDigest(
+                sortedInputs, new StaticMetadataProvider(metadata), execRoot, digestUtil))
+        .isEqualTo(expectedRootDigest);
 
     Digest[] dirDigests =
         new Digest[] {
