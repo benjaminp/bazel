@@ -78,3 +78,27 @@ Follow these guidelines for include paths:
    use the [`include_prefix`](be/c-cpp.html#cc_library.include_prefix) and
    [`strip_include_prefix`](be/c-cpp.html#cc_library.strip_include_prefix)
    arguments on the `cc_library` rule target.
+
+
+## Include Scanning
+
+### Basic Usage
+Enables the use of C/C++ include scanning when the ```--experimental_include_scanning``` flag is provided to the ```bazel build``` command. This flag improves performance by decreasing the size of compilation input trees.
+
+### Use cases
+--experimental_include_scanning is suited for the building of projects in C/C++ where the overhead of header files is large and it is not clear whether or not all of the header files are necessary for the compilation.
+
+### Limitations
+  - ```experimental_include_scanning``` does not use preprocessor directives, and so the flag cannot be used on projects which include them.
+  - Include scanning must not be enabled by default because limitations of the builtin include parser can break builds.
+  - There can be missing inlcudes when building a project with ```experimental_inlcude_scanning```, these can be overcome with the use of either patch files or Include Hints.
+
+### Advanced Features
+  - Include Hints:
+    - Include Hints are a hidden feature within the inlcude scanning patch, this consists of creating the file ```tools/cpp/INCLUDE_HINTS```. The INLCUDE_HINTS file contains regexp-based rules to help experimental_include_scanning cope with computed includes, which would otherwise require a full preprocessor with symbol support. Each line of the file should be split into four columns: ```&quot;file&quot;|&quot;path&quot;  match-pattern  find-root  find-filter```.
+      - Column 1: The first column specifies whether the line is a rule based on matching source **files** (passed directly to the compiler as inputs, or transitively #included by other inputs) or include **paths**.
+      - Column 2: The second column is a regexp for files or paths. Whenever a compiler argument of the specified type matches that regexp, the rule is taken.
+      - Column 3: The third column is a point in the local filesystem from which to extract a recursive listing.
+      - Column 4: The fourth column is a regexp applied to each file found by the recursive listing. All  matching files are treated as dependencies.
+  - Patch Files:
+    - Patch files can be used to manually add the missing include files if errors with these files are encountered. These patches should affect the ```cc_library``` within the corresponding ```BUILD.bazel``` file. This could consist of removing specific files from the exclude list or adding the file into the include list.
